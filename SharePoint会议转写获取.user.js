@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         SharePoint / Stream Transcript Grabber (トランスクリプト取得)
+// @name:zh-CN   SharePoint / Stream 会议转写获取
 // @namespace    https://github.com/local/sharepoint-stream-transcript
-// @version      1.0.0
-// @description  Microsoft Stream (SharePoint) の会議録画ページから、仮想スクロールで消えるトランスクリプトを全件取得して .txt / .json / .tsv で保存する。ネットワーク応答は暗号化されているため DOM を自動スクロールして収集する。
+// @version      1.2.1
+// @description  从 Microsoft Stream（SharePoint）的会议录像页面获取完整的会议转写（自动滚动收集被虚拟滚动隐藏的内容），可选 .txt / .tsv / .json 格式保存
 // @author       you
 // @match        *://*.sharepoint.com/*
 // @match        *://*.stream.office.com/*
@@ -17,11 +18,10 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ---- selectors (id-prefix based = build-independent) ----------------------
-  // Transcript entries are rendered by the OneTranscript React app with semantic
-  // ids: entry-N (the group), sub-entry-N (the text), timestampSpeakerAriaLabel-N
-  // (hidden "<speaker> <time>" label). These are far more stable than Fluent UI
-  // mergeStyles class hashes (e.g. baseEntry-447), whose suffixes change per build.
+  // ---- 选择器（基于 id 前缀，不随版本构建变化） ----------------------
+  // 转写条目由 OneTranscript（React 应用）渲染，带有语义化的 id：
+  // entry-N（整条）、sub-entry-N（正文）、timestampSpeakerAriaLabel-N（隐藏的“发言人 时间”标签）。
+  // 这些 id 比 Fluent UI mergeStyles 生成的类名哈希（如 baseEntry-447）稳定得多，后者每次构建都会变。
   const entryEls = () =>
     Array.from(document.querySelectorAll('[id^="entry-"]')).filter((el) =>
       /^entry-\d+$/.test(el.id)
@@ -42,7 +42,7 @@
     return null;
   }
 
-  // ---- harvest ---------------------------------------------------------------
+  // ---- 采集 ---------------------------------------------------------------
   function harvest(store) {
     for (const el of entryEls()) {
       const n = +el.id.slice('entry-'.length);
@@ -64,22 +64,21 @@
     return g;
   }
 
-  // ---- main grab -------------------------------------------------------------
+  // ---- 主流程 -------------------------------------------------------------
   async function grab(onProgress) {
     const first = entryEls()[0];
-    if (!first) throw new Error('トランスクリプトのエントリが見つかりません。左側の「トランスクリプト」パネルを開いてから実行してください。');
+    if (!first) throw new Error('找不到转写内容。请先打开左侧的“转写”（トランスクリプト）面板再执行。');
     const scroller = findScroller(first);
-    if (!scroller) throw new Error('スクロール可能なトランスクリプト コンテナが見つかりませんでした。');
+    if (!scroller) throw new Error('找不到可滚动的转写区域。');
 
-    // Pause the video so its auto-scroll (transcript follows playback) does not
-    // fight our scrolling and skip a band of entries.
+    // 先暂停视频，避免转写随播放自动滚动，与脚本的滚动冲突而跳过一段条目。
     const video = document.querySelector('video');
     if (video) { try { video.pause(); } catch (e) {} }
 
     const store = {};
     const H = scroller.scrollHeight;
 
-    // Phase 1: top -> bottom sweep with overlap.
+    // 第 1 阶段：从上到下带重叠地扫一遍。
     scroller.scrollTop = 0;
     await sleep(350);
     harvest(store);
@@ -93,7 +92,7 @@
       if (atBottom) { await sleep(250); harvest(store); break; }
     }
 
-    // Expected total: aria-setsize on a text entry, else max index seen.
+    // 预期总数：取正文条目上的 aria-setsize，没有时用见到的最大序号。
     let keys = sortedKeys(store);
     let maxN = keys[keys.length - 1];
     const sizedEl = document.querySelector('[id^="sub-entry-"][aria-setsize]');
@@ -101,9 +100,8 @@
     const hi = Math.max(maxN, setsize ? setsize - 1 : maxN);
     const total = hi + 1;
 
-    // Phase 2: fill gaps by jumping to each gap's estimated pixel position.
-    // The virtualizer renders a large buffer (~180 entries) around any position,
-    // so one well-placed jump fills a whole contiguous hole.
+    // 第 2 阶段：按估算的像素位置跳到每个缺口来补齐。
+    // 虚拟列表会在当前位置附近渲染一大段缓冲（约 180 条），跳准一次就能补上一整段连续的缺口。
     let gaps = gapsIn(store, hi);
     for (let iter = 0; iter < 80 && gaps.length; iter++) {
       const mid = gaps[Math.floor(gaps.length / 2)];
@@ -118,10 +116,9 @@
     return { store, total, remainingGaps: gaps };
   }
 
-  // ---- format ----------------------------------------------------------------
-  // label -> {speaker, mmss}. minutes are always present; seconds omitted on an
-  // exact minute. Speaker may contain digits (e.g. "WeWork-602"), so match the
-  // TRAILING time token and treat everything before it as the speaker.
+  // ---- 格式化 ----------------------------------------------------------------
+  // label -> {speaker, mmss}。“分”一定存在，整分钟时省略“秒”。
+  // 发言人名里可能有数字（如“WeWork-602”），所以只匹配末尾的时间，前面的全部当作发言人。
   const TIME_RE = /\s*(?:(\d+)\s*時間)?\s*(\d+)\s*分間?\s*(?:(\d+)\s*秒間?)?\s*$/;
   function parseLabel(label) {
     const m = label.match(TIME_RE);
@@ -155,7 +152,7 @@
 
   function buildTxt(rows, meta) {
     let out = meta.title + '\n' + meta.url + '\n' +
-      '総エントリ数: ' + rows.length + '\n' + '='.repeat(80) + '\n\n';
+      '总条数：' + rows.length + '\n' + '='.repeat(80) + '\n\n';
     for (const r of rows) {
       if (r.kind === 'event') { out += '--- ' + r.text + ' ---\n\n'; continue; }
       out += '[' + r.t + '] ' + r.speaker + '\n' + r.text + '\n\n';
@@ -189,49 +186,115 @@
   }
 
   // ---- UI --------------------------------------------------------------------
+  // 获取比较耗时，所以先保留结果，之后再选择保存格式
+  const FORMATS = [
+    { key: 'txt', label: 'TXT', type: 'text/plain', build: (r) => buildTxt(r.rows, r.meta) },
+    { key: 'tsv', label: 'TSV', type: 'text/tab-separated-values', build: (r) => buildTsv(r.rows) },
+    { key: 'json', label: 'JSON', type: 'application/json',
+      build: (r) => JSON.stringify({ meta: r.meta, total: r.total, rows: r.rows }, null, 2) },
+  ];
+  const PANEL_ID = '__tx_grab_panel';
+  const BASE_FONT = '600 13px/1.2 "Segoe UI",system-ui,sans-serif';
+
+  function styledButton(text, bg, color) {
+    const b = document.createElement('button');
+    b.textContent = text;
+    Object.assign(b.style, {
+      padding: '8px 12px', background: bg, color, border: 'none', borderRadius: '6px',
+      font: BASE_FONT, cursor: 'pointer'
+    });
+    return b;
+  }
+
+  function closePanel() {
+    const p = document.getElementById(PANEL_ID);
+    if (p) p.remove();
+  }
+
+  function showFormatPanel(result) {
+    closePanel();
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    Object.assign(panel.style, {
+      position: 'fixed', zIndex: 2147483647, right: '16px', bottom: '64px',
+      padding: '12px', background: '#fff', color: '#222', borderRadius: '8px',
+      boxShadow: '0 4px 14px rgba(0,0,0,.3)', font: BASE_FONT, maxWidth: '320px'
+    });
+
+    const info = document.createElement('div');
+    info.textContent = '已获取 ' + result.rows.length + ' 条';
+    info.style.marginBottom = '8px';
+    panel.appendChild(info);
+
+    if (result.remainingGaps.length) {
+      const warn = document.createElement('div');
+      warn.textContent = '⚠ ' + result.remainingGaps.length + ' 条未取到，可重新获取补全';
+      Object.assign(warn.style, { color: '#c62828', marginBottom: '8px', fontWeight: '400' });
+      panel.appendChild(warn);
+    }
+
+    const row = document.createElement('div');
+    Object.assign(row.style, { display: 'flex', gap: '6px', flexWrap: 'wrap' });
+    for (const f of FORMATS) {
+      const b = styledButton(f.label, '#5b2be6', '#fff');
+      b.addEventListener('click', () => {
+        download(result.base + '.' + f.key, f.build(result), f.type);
+        b.textContent = '✓ ' + f.label;
+      });
+      row.appendChild(b);
+    }
+    const close = styledButton('关闭', '#eee', '#333');
+    close.addEventListener('click', closePanel);
+    row.appendChild(close);
+    panel.appendChild(row);
+
+    document.body.appendChild(panel);
+  }
+
   function makeButton() {
     if (document.getElementById('__tx_grab_btn')) return;
     const btn = document.createElement('button');
     btn.id = '__tx_grab_btn';
-    btn.textContent = '📝 トランスクリプト取得';
+    btn.textContent = '📝 获取会议转写';
     Object.assign(btn.style, {
       position: 'fixed', zIndex: 2147483647, right: '16px', bottom: '16px',
       padding: '10px 14px', background: '#5b2be6', color: '#fff', border: 'none',
-      borderRadius: '8px', font: '600 13px/1.2 "Segoe UI",system-ui,sans-serif',
+      borderRadius: '8px', font: BASE_FONT,
       boxShadow: '0 4px 14px rgba(0,0,0,.3)', cursor: 'pointer'
     });
     btn.addEventListener('click', async () => {
       const original = btn.textContent;
       btn.disabled = true;
+      closePanel();
       try {
         const meta = { title: document.title, url: location.href };
-        const { store, total, remainingGaps } = await grab((got, exp) => {
-          btn.textContent = '取得中… ' + got + (exp ? '/' + exp : '');
-        });
-        const rows = toRows(store);
         const base = safeName();
-        download(base + '.txt', buildTxt(rows, meta), 'text/plain');
-        download(base + '.json', JSON.stringify({ meta, total, rows }, null, 2), 'application/json');
-        download(base + '.tsv', buildTsv(rows), 'text/tab-separated-values');
-        const warn = remainingGaps && remainingGaps.length
-          ? '（未取得 ' + remainingGaps.length + ' 件。もう一度実行すると補完されます）'
-          : '';
-        btn.textContent = '✅ ' + rows.length + ' 件 保存' + warn;
+        const { store, total, remainingGaps } = await grab((got, exp) => {
+          btn.textContent = '获取中… ' + got + (exp ? '/' + exp : '');
+        });
+        // 获取过程中切换到了别的视频时，结果会混在一起，不允许保存
+        if (location.href !== meta.url) throw new Error('获取过程中页面已切换，请重新执行。');
+        showFormatPanel({ rows: toRows(store), meta, total, remainingGaps, base });
       } catch (e) {
         console.error('[TranscriptGrabber]', e);
-        alert('取得に失敗しました:\n' + (e && e.message ? e.message : e));
-        btn.textContent = original;
+        alert('获取失败：\n' + (e && e.message ? e.message : e));
       } finally {
         btn.disabled = false;
-        setTimeout(() => { btn.textContent = original; }, 6000);
+        btn.textContent = original;
       }
     });
     document.body.appendChild(btn);
   }
 
-  // The Stream page is a SPA; keep trying to attach the button.
+  // 切换到别的视频后，关闭上一个视频的保存面板（避免保存旧内容）
+  let panelUrl = location.href;
+  setInterval(() => {
+    if (location.href !== panelUrl) { panelUrl = location.href; closePanel(); }
+  }, 1000);
+
+  // Stream 页面是单页应用，需要反复尝试挂上按钮。
   const iv = setInterval(makeButton, 1500);
   makeButton();
-  // stop after 2 min of attaching (button persists once added)
+  // 2 分钟后停止尝试（按钮挂上后会一直保留）
   setTimeout(() => clearInterval(iv), 120000);
 })();
