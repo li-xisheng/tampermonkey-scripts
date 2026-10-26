@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微信公众号文章转Markdown+图片ZIP
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
+// @version      2.3.1
 // @description  将微信公众号文章转换为Markdown，并连同图片一起打包下载为ZIP
 // @author       ChatGPT
 // @match        https://mp.weixin.qq.com/s/*
@@ -436,8 +436,32 @@
         'mp-style-type',
     ]);
 
-    // 微信视频容器：播放器 UI 含大量控件文字（倍速/全屏/进度条等），需整体替换为占位符
-    const VIDEO_CONTAINER_RE = /(?:^|\s)(?:js_page_video|page_video|video_iframe|js_video_channel_card|channel_video_card)/;
+    // 微信视频容器：播放器 UI 含大量控件文字（倍速/全屏/进度条等），需整体替换为占位符。
+    // 按 class token 精确匹配，避免 page_video_intro 之类前缀相似的普通容器被误吞
+    const VIDEO_CONTAINER_CLASSES = new Set([
+        'js_page_video', 'page_video',
+        'video_iframe', 'video_iframe_wrp',
+        'js_tx_video_container', 'tx_video_container',
+        'js_video_channel_card', 'channel_video_card',
+    ]);
+
+    function isVideoContainer(el) {
+        return getElementClass(el).split(/\s+/).some(token => VIDEO_CONTAINER_CLASSES.has(token));
+    }
+
+    function videoPlaceholder(container) {
+        // 原生 <video> 优先；腾讯视频/视频号用 <iframe> 承载
+        const videoEl = container.querySelector('video');
+        const iframeEl = videoEl ? null : container.querySelector('iframe');
+        const src = videoEl
+            ? absoluteUrl(videoEl.getAttribute('src') || videoEl.getAttribute('data-src') || '')
+            : iframeEl
+                ? absoluteUrl(iframeEl.getAttribute('data-src') || iframeEl.getAttribute('src') || '')
+                : '';
+        return src
+            ? `\n> 🎬 视频：[点击播放](${src})（链接可能有时效，失效请看原文）\n\n`
+            : '\n> 🎬 此处有视频，请查看原文\n\n';
+    }
 
     function htmlToMarkdown(node, imageCollector) {
         let markdown = '';
@@ -591,6 +615,24 @@
                 }
                 break;
             }
+            case 'mpvoice': {
+                // 音频组件：无子节点，信息在属性里
+                const audioName = child.getAttribute('name') || '';
+                markdown += `\n> 🎵 音频${audioName ? `：**${audioName}**` : ''}，请到原文收听\n\n`;
+                break;
+            }
+            case 'qqmusic': {
+                const musicName = child.getAttribute('musicname') || child.getAttribute('music_name') || '';
+                const singer = child.getAttribute('singer') || '';
+                markdown += `\n> 🎵 音乐${musicName ? `：**${musicName}**` : ''}${singer ? ` - ${singer}` : ''}，请到原文收听\n\n`;
+                break;
+            }
+            case 'mp-miniprogram': {
+                const mpTitle = child.getAttribute('data-miniprogram-title') || '';
+                const mpNick = child.getAttribute('data-miniprogram-nickname') || '';
+                markdown += `\n> 📱 小程序${mpTitle ? `：**${mpTitle}**` : ''}${mpNick ? `（${mpNick}）` : ''}，请到原文查看\n\n`;
+                break;
+            }
             case 'table':
                 markdown += processTable(child, imageCollector);
                 break;
@@ -633,14 +675,8 @@
             default: {
                 const cls = getElementClass(child);
                 // 视频容器整体替换为占位符，避免播放器控件文字混入正文
-                if (VIDEO_CONTAINER_RE.test(cls)) {
-                    const videoEl = child.querySelector('video');
-                    const src = videoEl
-                        ? absoluteUrl(videoEl.getAttribute('src') || videoEl.getAttribute('data-src') || '')
-                        : '';
-                    markdown += src
-                        ? `\n> 🎬 视频：[点击播放](${src})（链接可能有时效，失效请看原文）\n\n`
-                        : '\n> 🎬 此处有视频，请查看原文\n\n';
+                if (isVideoContainer(child)) {
+                    markdown += videoPlaceholder(child);
                     break;
                 }
                 // 微信代码片段特殊处理：跳过行号 <ul>，直接提取 <pre><code>
@@ -669,6 +705,17 @@
                         if (text) markdown += `\n${text}\n\n`;
                         break;
                     }
+                }
+                // 未识别的自定义组件（投票、商品卡片等）：通常无文本子节点、数据在属性里，
+                // 递归结果为空时留占位符，避免内容无感知丢失
+                const isCustomComponent = tag.includes('-')
+                    || Object.prototype.toString.call(child) === '[object HTMLUnknownElement]';
+                if (isCustomComponent) {
+                    const inner = htmlToMarkdown(child, imageCollector);
+                    markdown += inner.trim()
+                        ? inner
+                        : `\n> 📎 此处有暂不支持的组件（${tag}），请查看原文\n\n`;
+                    break;
                 }
                 markdown += htmlToMarkdown(child, imageCollector);
                 break;
