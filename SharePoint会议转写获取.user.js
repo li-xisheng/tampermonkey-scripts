@@ -2,16 +2,22 @@
 // @name         SharePoint / Stream Transcript Grabber (トランスクリプト取得)
 // @name:zh-CN   SharePoint / Stream 会议转写获取
 // @namespace    https://github.com/local/sharepoint-stream-transcript
-// @version      1.2.1
-// @description  从 Microsoft Stream（SharePoint）的会议录像页面获取完整的会议转写（自动滚动收集被虚拟滚动隐藏的内容），可选 .txt / .tsv / .json 格式保存
+// @version      1.3.1
+// @description  从 Microsoft Stream（SharePoint）的会议录像页面，或 Teams 会议“まとめ”页的转写面板获取完整的会议转写（自动滚动收集被虚拟滚动隐藏的内容），可选 .txt / .tsv / .json 格式保存
 // @author       you
 // @match        *://*.sharepoint.com/*
 // @match        *://*.stream.office.com/*
 // @match        *://*.microsoftstream.com/*
+// @match        *://*.teams.microsoft.com/*
+// @match        *://teams.cloud.microsoft/*
+// @match        *://*.teams.cloud.microsoft/*
+// @match        *://*.office.com/*
 // @run-at       document-idle
 // @grant        none
-// @noframes
 // ==/UserScript==
+
+// Teams 的“まとめ”页里，转写面板嵌在 iframe 中，所以不加 @noframes，
+// 只有页面里真的出现转写条目时才显示按钮
 
 (function () {
   'use strict';
@@ -75,20 +81,64 @@
     const video = document.querySelector('video');
     if (video) { try { video.pause(); } catch (e) {} }
 
+    // 获取期间锁住转写面板，屏蔽页面自己的滚动（跟随播放位置），取完恢复
+    const lock = lockScroll(scroller);
+    try {
+      return await sweep(scroller, lock.setTop, onProgress);
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * 锁住滚动容器：页面对它的 scrollTop / scrollTo 等写入一律忽略，
+   * 容器内元素的 scrollIntoView 也不生效。只有返回的 setTop 能真正滚动
+   */
+  function lockScroll(scroller) {
+    const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+    const origIntoView = Element.prototype.scrollIntoView;
+    const noop = () => {};
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get() { return desc.get.call(this); },
+      set: noop,
+    });
+    ['scrollTo', 'scroll', 'scrollBy'].forEach(k => { scroller[k] = noop; });
+    Element.prototype.scrollIntoView = function (...args) {
+      if (scroller.contains(this)) return undefined;
+      return origIntoView.apply(this, args);
+    };
+    return {
+      setTop: v => desc.set.call(scroller, v),
+      release() {
+        ['scrollTop', 'scrollTo', 'scroll', 'scrollBy'].forEach(k => { delete scroller[k]; });
+        Element.prototype.scrollIntoView = origIntoView;
+      },
+    };
+  }
+
+  async function sweep(scroller, setTop, onProgress) {
     const store = {};
-    const H = scroller.scrollHeight;
 
     // 第 1 阶段：从上到下带重叠地扫一遍。
-    scroller.scrollTop = 0;
+    // 位置由脚本自己记住（pos），万一仍被拉走也能回到原位，不会从头重扫
+    setTop(0);
     await sleep(350);
     harvest(store);
     const step = Math.max(250, Math.floor(scroller.clientHeight * 0.5));
+    let pos = 0;
     for (let i = 0; i < 400; i++) {
-      const atBottom = scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 2;
-      scroller.scrollTop = Math.min(scroller.scrollTop + step, scroller.scrollHeight);
+      const maxTop = scroller.scrollHeight - scroller.clientHeight;
+      const atBottom = pos >= maxTop - 2;
+      pos = Math.min(pos + step, maxTop);
+      setTop(pos);
       await sleep(150);
+      if (Math.abs(scroller.scrollTop - pos) > step) {
+        setTop(pos);
+        await sleep(150);
+      }
       harvest(store);
-      if (onProgress) onProgress(sortedKeys(store).length, null);
+      if (onProgress) onProgress(sortedKeys(store).length, null, '获取中');
       if (atBottom) { await sleep(250); harvest(store); break; }
     }
 
@@ -100,17 +150,19 @@
     const hi = Math.max(maxN, setsize ? setsize - 1 : maxN);
     const total = hi + 1;
 
-    // 第 2 阶段：按估算的像素位置跳到每个缺口来补齐。
+    // 第 2 阶段：按估算的像素位置跳到每个缺口来补齐（这一步跳到上方是正常的）。
     // 虚拟列表会在当前位置附近渲染一大段缓冲（约 180 条），跳准一次就能补上一整段连续的缺口。
+    // 列表高度在第 1 阶段中可能变化，所以每次都按当前高度估算位置
     let gaps = gapsIn(store, hi);
     for (let iter = 0; iter < 80 && gaps.length; iter++) {
+      const H = scroller.scrollHeight;
       const mid = gaps[Math.floor(gaps.length / 2)];
       const px = Math.floor(H * (mid / total));
-      scroller.scrollTop = px; await sleep(240); harvest(store);
-      scroller.scrollTop = Math.max(0, px - 900); await sleep(160); harvest(store);
-      scroller.scrollTop = Math.min(H, px + 900); await sleep(160); harvest(store);
+      setTop(px); await sleep(240); harvest(store);
+      setTop(Math.max(0, px - 900)); await sleep(160); harvest(store);
+      setTop(Math.min(H, px + 900)); await sleep(160); harvest(store);
       gaps = gapsIn(store, hi);
-      if (onProgress) onProgress(sortedKeys(store).length, total);
+      if (onProgress) onProgress(sortedKeys(store).length, total, '补齐中');
     }
 
     return { store, total, remainingGaps: gaps };
@@ -168,12 +220,35 @@
     return out;
   }
 
+  // 没有意义的页面标题（Teams 的 iframe 里常见），不能拿来当文件名
+  const GENERIC_TITLE_RE = /^(|microsoft teams|teams|microsoft stream|stream|onetranscript|transcript|トランスクリプト)$/i;
+
+  /** 找录像文件名：先看页面标题，再看页面地址里的 .mp4 路径（Teams iframe 的地址里带着它） */
+  function recordingName() {
+    const title = (document.title || '').trim();
+    if (!GENERIC_TITLE_RE.test(title)) return title;
+    let href = location.href;
+    try { href = decodeURIComponent(href); } catch (e) { /* 解码失败就用原样 */ }
+    const m = /([^/?&=#]+)\.mp4/i.exec(href);
+    return m ? m[1] : '';
+  }
+
+  /**
+   * 文件名：“会议名_日期”。
+   * 录像名形如“会议名-20261026_090102UTC-Meeting Recording.mp4”，去掉多余部分；
+   * 拿不到会议名时用“会议转写_导出时间”
+   */
   function safeName() {
-    const base = (document.title || 'transcript')
+    const pad = (x) => String(x).padStart(2, '0');
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const raw = recordingName()
       .replace(/\.mp4$/i, '')
-      .replace(/[\\/:*?"<>|]+/g, '_')
-      .slice(0, 120);
-    return base || 'transcript';
+      .replace(/[-_ ]*Meeting Recording$/i, '')
+      .trim();
+    const dated = /^(.*?)[-_ ]*(\d{8})_\d{6}(?:UTC)?$/i.exec(raw);
+    const base = dated ? `${dated[1]}_${dated[2]}` : (raw || `会议转写_${stamp}`);
+    return base.replace(/[\\/:*?"<>|\x00-\x1F]+/g, '_').trim().slice(0, 120) || `会议转写_${stamp}`;
   }
 
   function download(name, text, type) {
@@ -267,10 +342,10 @@
       btn.disabled = true;
       closePanel();
       try {
-        const meta = { title: document.title, url: location.href };
+        const meta = { title: recordingName() || document.title, url: location.href };
         const base = safeName();
-        const { store, total, remainingGaps } = await grab((got, exp) => {
-          btn.textContent = '获取中… ' + got + (exp ? '/' + exp : '');
+        const { store, total, remainingGaps } = await grab((got, exp, phase) => {
+          btn.textContent = (phase || '获取中') + '… ' + got + (exp ? '/' + exp : '');
         });
         // 获取过程中切换到了别的视频时，结果会混在一起，不允许保存
         if (location.href !== meta.url) throw new Error('获取过程中页面已切换，请重新执行。');
@@ -292,9 +367,14 @@
     if (location.href !== panelUrl) { panelUrl = location.href; closePanel(); }
   }, 1000);
 
-  // Stream 页面是单页应用，需要反复尝试挂上按钮。
-  const iv = setInterval(makeButton, 1500);
-  makeButton();
-  // 2 分钟后停止尝试（按钮挂上后会一直保留）
-  setTimeout(() => clearInterval(iv), 120000);
+  // 页面是单页应用，转写面板随时可能打开或关闭，所以定期检查：
+  // 有转写条目时显示按钮，没有时隐藏（获取中除外）
+  function syncButton() {
+    const has = entryEls().length > 0;
+    const btn = document.getElementById('__tx_grab_btn');
+    if (has && !btn) makeButton();
+    if (btn && !btn.disabled) btn.style.display = has ? '' : 'none';
+  }
+  setInterval(syncButton, 1500);
+  syncButton();
 })();
